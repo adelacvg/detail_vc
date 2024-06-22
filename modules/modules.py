@@ -10,6 +10,7 @@ from modules.DSConv import (
     remove_weight_norm_modules,
     weight_norm_modules,
 )
+import numpy as np
 
 LRELU_SLOPE = 0.1
 
@@ -117,6 +118,83 @@ class ConvNorm(nn.Module):
         out = self.conv(input)
         return out
 
+class ScaledDotProductAttention(nn.Module):
+    """Scaled Dot-Product Attention"""
+
+    def __init__(self, temperature, dropout):
+        super().__init__()
+        self.temperature = temperature
+        self.softmax = nn.Softmax(dim=2)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, q, k, v, mask=None):
+        attn = torch.bmm(q, k.transpose(1, 2))
+        attn = attn / self.temperature
+
+        if mask is not None:
+            attn = attn.masked_fill(mask, -np.inf)
+
+        attn = self.softmax(attn)
+        p_attn = self.dropout(attn)
+
+        output = torch.bmm(p_attn, v)
+        return output, attn
+
+class MultiHeadAttention(nn.Module):
+    """Multi-Head Attention module"""
+
+    def __init__(self, n_head, d_model, d_k, d_v, dropout=0.0, spectral_norm=False):
+        super().__init__()
+
+        self.n_head = n_head
+        self.d_k = d_k
+        self.d_v = d_v
+
+        self.w_qs = nn.Linear(d_model, n_head * d_k)
+        self.w_ks = nn.Linear(d_model, n_head * d_k)
+        self.w_vs = nn.Linear(d_model, n_head * d_v)
+
+        self.attention = ScaledDotProductAttention(
+            temperature=np.power(d_model, 0.5), dropout=dropout
+        )
+
+        self.fc = nn.Linear(n_head * d_v, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        if spectral_norm:
+            self.w_qs = nn.utils.spectral_norm(self.w_qs)
+            self.w_ks = nn.utils.spectral_norm(self.w_ks)
+            self.w_vs = nn.utils.spectral_norm(self.w_vs)
+            self.fc = nn.utils.spectral_norm(self.fc)
+
+    def forward(self, x, mask=None):
+        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
+        sz_b, len_x, _ = x.size()
+
+        residual = x
+
+        q = self.w_qs(x).view(sz_b, len_x, n_head, d_k)
+        k = self.w_ks(x).view(sz_b, len_x, n_head, d_k)
+        v = self.w_vs(x).view(sz_b, len_x, n_head, d_v)
+        q = q.permute(2, 0, 1, 3).contiguous().view(-1, len_x, d_k)  # (n*b) x lq x dk
+        k = k.permute(2, 0, 1, 3).contiguous().view(-1, len_x, d_k)  # (n*b) x lk x dk
+        v = v.permute(2, 0, 1, 3).contiguous().view(-1, len_x, d_v)  # (n*b) x lv x dv
+
+        if mask is not None:
+            slf_mask = mask.repeat(n_head, 1, 1)  # (n*b) x .. x ..
+        else:
+            slf_mask = None
+        output, attn = self.attention(q, k, v, mask=slf_mask)
+
+        output = output.view(n_head, sz_b, len_x, d_v)
+        output = (
+            output.permute(1, 2, 0, 3).contiguous().view(sz_b, len_x, -1)
+        )  # b x lq x (n*dv)
+
+        output = self.fc(output)
+
+        output = self.dropout(output) + residual
+        return output, attn
 
 class MelStyleEncoder(nn.Module):
     """MelStyleEncoder"""

@@ -51,47 +51,6 @@ class ResidualCouplingBlock(nn.Module):
                 x = flow(x, x_mask, g=g, reverse=reverse)
         return x
 
-class TransformerCouplingBlock(nn.Module):
-    def __init__(self,
-                 channels,
-                 hidden_channels,
-                 filter_channels,
-                 n_heads,
-                 n_layers,
-                 kernel_size,
-                 p_dropout,
-                 n_flows=4,
-                 gin_channels=0,
-                 share_parameter=False
-                 ):
-            
-        super().__init__()
-        self.channels = channels
-        self.hidden_channels = hidden_channels
-        self.kernel_size = kernel_size
-        self.n_layers = n_layers
-        self.n_flows = n_flows
-        self.gin_channels = gin_channels
-
-        self.flows = nn.ModuleList()
-
-        self.wn = attentions.FFT(hidden_channels, filter_channels, n_heads, n_layers, kernel_size, p_dropout, isflow = True, gin_channels = self.gin_channels) if share_parameter else None
-
-        for i in range(n_flows):
-            self.flows.append(
-                modules.TransformerCouplingLayer(channels, hidden_channels, kernel_size, n_layers, n_heads, p_dropout, filter_channels, mean_only=True, wn_sharing_parameter=self.wn, gin_channels = self.gin_channels))
-            self.flows.append(modules.Flip())
-
-    def forward(self, x, x_mask, g=None, reverse=False):
-        if not reverse:
-            for flow in self.flows:
-                x, _ = flow(x, x_mask, g=g, reverse=reverse)
-        else:
-            for flow in reversed(self.flows):
-                x = flow(x, x_mask, g=g, reverse=reverse)
-        return x
-
-
 class Encoder(nn.Module):
     def __init__(self,
                  in_channels,
@@ -124,6 +83,69 @@ class Encoder(nn.Module):
         z = (m + torch.randn_like(m) * torch.exp(logs)) * x_mask
         return z, m, logs, x_mask
 
+class SpecEncoder(nn.Module):
+    def __init__(
+        self,
+        out_channels,
+        hidden_channels,
+        filter_channels,
+        sample,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout,
+        latent_channels=192,
+        gin_channels = None,
+    ):
+        super().__init__()
+        self.out_channels = out_channels
+        self.hidden_channels = hidden_channels
+        self.filter_channels = filter_channels
+        self.sample = sample
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.kernel_size = kernel_size
+        self.p_dropout = p_dropout
+        self.latent_channels = latent_channels
+        self.gin_channels = gin_channels
+
+        self.encoder = attentions.Encoder(
+            hidden_channels,
+            filter_channels,
+            n_heads,
+            n_layers,
+            kernel_size,
+            p_dropout,
+        )
+        self.out_proj = nn.Conv1d(hidden_channels, out_channels, 1)
+        if self.gin_channels is not None:
+            self.ge_proj = nn.Linear(gin_channels,hidden_channels)
+        if self.sample==True:
+            self.proj = nn.Conv1d(out_channels, out_channels * 2, 1)
+
+    def forward(self, y, y_lengths, g=None, refer=None, refer_lengths=None):
+        y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, y.size(2)), 1).to(
+            y.dtype
+        )
+        if g is not None:
+            y = y + self.ge_proj(g.squeeze(-1)).unsqueeze(-1)
+        if refer is not None:
+            y_mask2 = torch.unsqueeze(commons.sequence_mask(y_lengths+refer_lengths, y.size(2)+refer.shape[2]), 1).to(
+                y.dtype
+            )
+            T = y.shape[-1]
+            y = torch.cat([y,refer],dim=2)
+            y = self.encoder(y * y_mask2, y_mask2)
+            y = y[:,:,:T]
+        else:
+            y = self.encoder(y * y_mask, y_mask)
+        y = self.out_proj(y)
+        if self.sample==False:
+            return y*y_mask
+
+        stats = self.proj(y) * y_mask
+        m, logs = torch.split(stats, self.out_channels, dim=1)
+        return y, m, logs
 
 class TextEncoder(nn.Module):
     def __init__(self,
@@ -155,11 +177,11 @@ class TextEncoder(nn.Module):
     def forward(self, x, x_mask, f0=None, noice_scale=1):
         x = x + self.f0_emb(f0).transpose(1, 2)
         x = self.enc_(x * x_mask, x_mask)
-        stats = self.proj(x) * x_mask
-        m, logs = torch.split(stats, self.out_channels, dim=1)
-        z = (m + torch.randn_like(m) * torch.exp(logs) * noice_scale) * x_mask
+        stats = x
+        x = self.proj(x) * x_mask
+        m, logs = torch.split(x, self.out_channels, dim=1)
 
-        return z, m, logs, x_mask
+        return stats, m, logs, x_mask
 
 
 class DiscriminatorP(torch.nn.Module):
@@ -325,8 +347,10 @@ class F0Decoder(nn.Module):
         self.f0_prenet = nn.Conv1d(1, hidden_channels, 3, padding=1)
         self.cond = nn.Conv1d(spk_channels, hidden_channels, 1)
 
-    def forward(self, x, norm_f0, x_mask, spk_emb=None):
+    def forward(self, x, norm_f0, x_mask, spk_emb=None, detail=None):
         x = torch.detach(x)
+        if detail is not None:
+            x = x + detail
         if (spk_emb is not None):
             x = x + self.cond(spk_emb)
         x += self.f0_prenet(norm_f0)
@@ -334,7 +358,6 @@ class F0Decoder(nn.Module):
         x = self.decoder(x * x_mask, x_mask)
         x = self.proj(x) * x_mask
         return x
-
 
 class SynthesizerTrn(nn.Module):
     """
@@ -359,7 +382,6 @@ class SynthesizerTrn(nn.Module):
                  upsample_kernel_sizes,
                  gin_channels,
                  ssl_dim,
-                 n_speakers,
                  sampling_rate=44100,
                  vol_embedding=False,
                  vocoder_name = "nsf-hifigan",
@@ -390,7 +412,6 @@ class SynthesizerTrn(nn.Module):
         self.gin_channels = gin_channels
         self.ssl_dim = ssl_dim
         self.vol_embedding = vol_embedding
-        self.emb_g = nn.Embedding(n_speakers, gin_channels)
         self.use_depthwise_conv = use_depthwise_conv
         self.use_automatic_f0_prediction = use_automatic_f0_prediction
         self.n_layers_trans_flow = n_layers_trans_flow
@@ -399,7 +420,19 @@ class SynthesizerTrn(nn.Module):
 
         self.pre = nn.Conv1d(ssl_dim, hidden_channels, kernel_size=5, padding=2)
 
-        self.enc_p = TextEncoder(
+        self.enc_p = []
+        self.enc_p.extend(
+            [
+                modules.WN(hidden_channels, 5, 1, 16, gin_channels=gin_channels),
+                SpecEncoder(
+                    inter_channels, hidden_channels, filter_channels, True, n_heads,
+                6, kernel_size, p_dropout,gin_channels=gin_channels),
+            ]
+        )
+        self.enc_p = nn.ModuleList(self.enc_p)
+        self.spec_proj = nn.Conv1d(spec_channels, hidden_channels, 1)
+
+        self.enc_text = TextEncoder(
             inter_channels,
             hidden_channels,
             filter_channels=filter_channels,
@@ -452,29 +485,58 @@ class SynthesizerTrn(nn.Module):
                 spk_channels=gin_channels
             )
         self.emb_uv = nn.Embedding(2, hidden_channels)
+        nn.init.normal_(self.emb_uv.weight, 0.0, hidden_channels**-0.5)
+
         self.character_mix = False
+        
+        self.refer_feature_enc = SpecEncoder(
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            False,
+            n_heads,
+            4,
+            kernel_size,
+            p_dropout,
+            latent_channels=192,
+        )
+        self.detail_enc = SpecEncoder(
+            inter_channels,
+            hidden_channels,
+            filter_channels,
+            False,
+            n_heads,
+            6,
+            kernel_size,
+            p_dropout,
+            latent_channels=192,
+            gin_channels = gin_channels,
+        )
 
-    def forward(self, c, f0, uv, spec, g=None, c_lengths=None, spec_lengths=None, vol = None):
-        g = self.emb_g(g).transpose(1,2)
-
-        # vol proj
-        vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol is not None and self.vol_embedding else 0
+    def forward(self, c, f0, uv, spec, c_lengths=None, spec_lengths=None):
+        x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
+        spec_mask = torch.unsqueeze(commons.sequence_mask(spec_lengths, spec.size(2)), 1).to(c.dtype)
+        g = self.ref_enc(spec,spec_mask)
 
         # ssl prenet
-        x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
-        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1,2) + vol
+        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1,2)
         
         # f0 predict
-        if self.use_automatic_f0_prediction:
-            lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
-            norm_lf0 = utils.normalize_f0(lf0, x_mask, uv)
-            pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
-        else:
-            lf0 = 0
-            norm_lf0 = 0
-            pred_lf0 = 0
+        lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
+        norm_lf0 = utils.normalize_f0(lf0, x_mask, uv)
+        pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
         # encoder
-        z_ptemp, m_p, logs_p, _ = self.enc_p(x, x_mask, f0=f0_to_coarse(f0))
+        x, m_t, logs_t, _ = self.enc_text(x, x_mask, f0=f0_to_coarse(f0))
+        spec_mask = x_mask
+        spec2 = self.spec_proj(spec)*spec_mask
+        detail = self.enc_p[0](spec2, spec_mask, g)
+        detail_ = self.detail_enc(x, spec_lengths, g=g)
+        l_detail = torch.sum(((detail - detail_) ** 2)*spec_mask) / torch.sum(spec_mask)
+        x = x + detail
+        refer_feature = self.refer_feature_enc(spec2, spec_lengths)
+        x, m_p, logs_p = self.enc_p[1](x, spec_lengths,g=g, refer=refer_feature,refer_lengths=spec_lengths)
+        latent = x
+
         z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g)
 
         # flow
@@ -484,35 +546,19 @@ class SynthesizerTrn(nn.Module):
         # nsf decoder
         o = self.dec(z_slice, g=g, f0=pitch_slice)
 
-        return o, ids_slice, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q), pred_lf0, norm_lf0, lf0
+        return o, ids_slice, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t), pred_lf0, norm_lf0, lf0, l_detail, latent
 
     @torch.no_grad()
-    def infer(self, c, f0, uv, g=None, noice_scale=0.35, seed=52468, predict_f0=False, vol = None):
-
-        if c.device == torch.device("cuda"):
-            torch.cuda.manual_seed_all(seed)
-        else:
-            torch.manual_seed(seed)
-
-        c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
-
-        if self.character_mix and len(g) > 1:   # [N, S]  *  [S, B, 1, H]
-            g = g.reshape((g.shape[0], g.shape[1], 1, 1, 1))  # [N, S, B, 1, 1]
-            g = g * self.speaker_map  # [N, S, B, 1, H]
-            g = torch.sum(g, dim=1) # [N, 1, B, 1, H]
-            g = g.transpose(0, -1).transpose(0, -2).squeeze(0) # [B, H, N]
-        else:
-            if g.dim() == 1:
-                g = g.unsqueeze(0)
-            g = self.emb_g(g).transpose(1, 2)
+    def infer(self, c, c_lengths, f0, uv, refer, refer_lengths, noice_scale=0.35, predict_f0=True):
+        refer_mask = torch.unsqueeze(
+            commons.sequence_mask(refer_lengths, refer.size(2)), 1).to(refer.dtype)
+        c_mask = torch.unsqueeze(
+            commons.sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
+        g = self.ref_enc(refer, refer_mask)
         
         x_mask = torch.unsqueeze(commons.sequence_mask(c_lengths, c.size(2)), 1).to(c.dtype)
-        # vol proj
-        
-        vol = self.emb_vol(vol[:,:,None]).transpose(1,2) if vol is not None and self.vol_embedding else 0
 
-        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2) + vol
-
+        x = self.pre(c) * x_mask + self.emb_uv(uv.long()).transpose(1, 2)
         
         if self.use_automatic_f0_prediction and predict_f0:
             lf0 = 2595. * torch.log10(1. + f0.unsqueeze(1) / 700.) / 500
@@ -520,7 +566,14 @@ class SynthesizerTrn(nn.Module):
             pred_lf0 = self.f0_decoder(x, norm_lf0, x_mask, spk_emb=g)
             f0 = (700 * (torch.pow(10, pred_lf0 * 500 / 2595) - 1)).squeeze(1)
         
-        z_p, m_p, logs_p, c_mask = self.enc_p(x, x_mask, f0=f0_to_coarse(f0), noice_scale=noice_scale)
-        z = self.flow(z_p, c_mask, g=g, reverse=True)
+        x, m_t, logs_t, _ = self.enc_text(x, x_mask, f0=f0_to_coarse(f0))
+        detail = self.detail_enc(x, c_lengths, g=g)
+        x = x + detail
+        spec = self.spec_proj(refer)*refer_mask
+        refer_feature = self.refer_feature_enc(spec, refer_lengths)
+        z_p, m_p, logs_p = self.enc_p[1](x, c_lengths,g=g, refer=refer_feature,refer_lengths=refer_lengths)
+
+        z = (m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noice_scale) * x_mask
+        z = self.flow(z, c_mask, g=g, reverse=True)
         o = self.dec(z * c_mask, g=g, f0=f0)
         return o,f0

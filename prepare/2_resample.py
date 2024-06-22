@@ -42,7 +42,7 @@ def process(item):
     spkdir, wav_name, args = item
 
     wav_path = os.path.join(spkdir, wav_name)
-    speaker = spkdir.replace("\\", "/").split("/")[-2]
+    speaker =  spkdir.replace("\\", "/").split("/")[-3] + spkdir.replace("\\", "/").split("/")[-2]
     if os.path.exists(wav_path) and '.wav' in wav_path:
         os.makedirs(os.path.join(args.out_dir2, speaker), exist_ok=True)
 
@@ -55,11 +55,6 @@ def process(item):
             resampled_wav /= np.max(np.abs(resampled_wav))
 
         save_path2 = os.path.join(args.out_dir2, speaker, wav_name)
-        cnt = 0
-        save_path2 = '.'.join(save_path2.split('.')[:-1])+'_'+str(cnt)+'.'+save_path2.split('.')[-1]
-        if os.path.exists(save_path2):
-            cnt = int(save_path2[-1])
-            save_path2 = '.'.join(save_path2.split('.')[:-1])[:-1]+'_'+str(cnt)+'.'+save_path2.split('.')[-1]
         save_wav_to_path(resampled_wav, save_path2, args.sr2)
 
 

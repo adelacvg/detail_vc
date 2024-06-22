@@ -11,7 +11,6 @@ from pathlib import Path
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from utils.log_utils import clean_checkpoints, plot_spectrogram_to_numpy, summarize
-from dataset import DetailDataset, DetailCollater
 from typing import List, Optional, Tuple, Union
 import torch
 import os
@@ -21,15 +20,14 @@ import torch.nn.functional as F
 from torch import nn
 from torch.optim import AdamW
 from accelerate import Accelerator
-from model import SynthesizerTrn
-from ttts.utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HParams, spectrogram_torch
-from ttts.utils import commons
+from model_vc import SynthesizerTrn, MultiPeriodDiscriminator
+from dataset_vc import TextAudioCollate, TextAudioSpeakerLoader
+from utils.data_utils import spec_to_mel_torch, mel_spectrogram_torch, HParams, spectrogram_torch
+from utils import utils
+import modules.commons as commons
 import torchaudio
-from ttts.vqvae.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
-from ttts.vqvae.hifigan import MultiPeriodDiscriminator
-from ttts.vqvae.augment import Augment
+from modules.losses import generator_loss, discriminator_loss, feature_loss, kl_loss
 from torchaudio.functional import phase_vocoder, resample, spectrogram
-from torch_pitch_shift import pitch_shift
 from torchaudio import transforms
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = False
@@ -86,23 +84,17 @@ class Trainer(object):
         hps = HParams(**self.cfg)
         self.hps = hps
         self.config = hps
-        dataset = VQGANDataset(hps)
-        eval_dataset = VQGANDataset(hps)
-        train_sampler = BucketSampler(
-            dataset, hps.train.batch_size,
-            [32, 300, 400, 500, 600, 700, 800, 900, 1000,
-                1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900,],
-            shuffle=True,)
-        collate_fn=VQVAECollater()
+        dataset = TextAudioSpeakerLoader(hps.data.training_files, hps)
+        collate_fn = TextAudioCollate()
+        num_workers = 5
         self.dataloader = DataLoader(
             dataset,
-            # batch_size=hps.train.batch_size,
-            num_workers=hps.dataloader.num_workers,
+            batch_size=hps.train.batch_size,
+            num_workers=num_workers,
             shuffle=False,
             pin_memory=True,
-            collate_fn=collate_fn,
-            batch_sampler=train_sampler,
             persistent_workers=True,
+            collate_fn=collate_fn,
             prefetch_factor=16,)
         self.train_steps = self.cfg['train']['train_steps']
         self.val_freq = self.cfg['train']['val_freq']
@@ -110,7 +102,7 @@ class Trainer(object):
             now = datetime.now()
             self.logs_folder = Path(self.cfg['train']['logs_folder']+'/'+now.strftime("%Y-%m-%d-%H-%M-%S"))
             self.logs_folder.mkdir(exist_ok = True, parents=True)
-        self.G = SynthesizerTrn(hps.data.filter_length // 2 + 1,hps.train.segment_size // hps.data.hop_length, **hps.vqvae)
+        self.G = SynthesizerTrn(hps.data.filter_length // 2 + 1,hps.train.segment_size // hps.data.hop_length, **hps.model)
         self.D = MultiPeriodDiscriminator()
         print("G params:", count_parameters(self.G))
         print("D params:", count_parameters(self.D))
@@ -182,24 +174,16 @@ class Trainer(object):
             while self.step < self.train_steps:
                 self.dataloader.batch_sampler.epoch=epoch
                 for data in self.dataloader:
-                    if data is None:
-                        continue
+                    data = [d.to(device) for d in data]
+                    c, f0, spec, y, lengths, uv = data
+                    wav = y
                     # with torch.autograd.detect_anomaly():
-                    wav = data['wav'].to(device)
-                    wav_length = data['wav_lengths'].to(device)
-                    text = data['text'].to(device)
-                    text_length = data['text_lengths'].to(device)
-                    spec = spectrogram_torch(wav, self.hps.data.filter_length,
-                        self.hps.data.hop_length, self.hps.data.win_length, center=False).squeeze(0)
-                    prosody = mel_spectrogram_torch(
-                            wav, hps.data.filter_length, hps.data.prosody_channels, hps.data.sampling_rate, hps.data.hop_length,
-                            hps.data.win_length, hps.data.mel_fmin, hps.data.mel_fmax)
-                    spec_length = torch.LongTensor([
-                        x//self.hps.data.hop_length for x in wav_length]).to(device)
                     with self.accelerator.autocast():
-                        (y_hat, ids_slice, l_length, l_detail, l_dur_detail, z_mask,
-                            (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),
-                            latent,) = self.G(spec, spec_length, text, text_length)
+                        y_hat, ids_slice, z_mask, \
+                        (z, z_p, m_p, logs_p, m_q, logs_q, m_t, logs_t),\
+                        pred_lf0, norm_lf0, lf0, l_detail,\
+                        latent = self.G(c, f0, uv, spec,
+                            c_lengths=lengths, spec_lengths=lengths)
                         #  ssl, y, y_lengths, text, text_length
                         mel = spec_to_mel_torch(
                             spec,
@@ -223,9 +207,7 @@ class Trainer(object):
                             hps.data.mel_fmax,
                         )
 
-                        y = commons.slice_segments(
-                            wav.unsqueeze(1), ids_slice * hps.data.hop_length, hps.train.segment_size
-                        )  # slice
+                        y = commons.slice_segments(y, ids_slice * hps.data.hop_length, hps.train.segment_size)  # slice
                         # Discriminator
                         y_d_hat_r, y_d_hat_g, _, _ = self.D(y, y_hat.detach())
                     loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
@@ -251,16 +233,15 @@ class Trainer(object):
                     with self.accelerator.autocast():
                         y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.D(y, y_hat)
                     loss_detail = l_detail
-                    loss_dur_detail = l_dur_detail
-                    loss_dur = torch.sum(l_length.float())
+                    loss_lf0 = F.mse_loss(pred_lf0, lf0)
                     loss_mel = F.l1_loss(y_mel, y_hat_mel) * 45
                     loss_kl = kl_loss(z_p, logs_q, m_p, logs_p, z_mask)
                     loss_kl_text = kl_loss(z_p, logs_q, m_t, logs_t, z_mask)
                     loss_fm = feature_loss(fmap_r, fmap_g)
                     loss_gen, losses_gen = generator_loss(y_d_hat_g)
                     loss_gen_all = loss_gen + loss_fm + loss_mel \
-                        + loss_kl + loss_kl_text + loss_dur \
-                        + loss_detail + loss_dur_detail
+                        + loss_kl + loss_kl_text + loss_lf0 \
+                        + loss_detail
 
                     self.G_optimizer.zero_grad()
                     self.accelerator.backward(loss_gen_all)
@@ -276,16 +257,15 @@ class Trainer(object):
                         eval_model = self.accelerator.unwrap_model(self.G)
                         eval_model.eval()
                         with torch.no_grad():
-                            wav_eval = eval_model.infer(text, text_length, spec, spec_length)
+                            wav_eval,_ = eval_model.infer(c, lengths, f0, uv, spec, lengths)
                         eval_model.train()
                         scalar_dict = {
                                 "gen/loss_gen_all": loss_gen_all,
                                 "gen/loss_gen":loss_gen,
                                 'gen/loss_fm':loss_fm,
                                 'gen/loss_mel':loss_mel,
-                                'gen/loss_dur':loss_dur,
+                                'gen/loss_lf0':loss_lf0,
                                 'gen/loss_detail':loss_detail, 
-                                'gen/loss_dur_detail':loss_dur_detail,
                                 'gen/loss_kl':loss_kl, 
                                 'gen/loss_kl_text':loss_kl_text,
                                 "norm/G_grad": grad_norm_g, 
@@ -298,9 +278,13 @@ class Trainer(object):
                             "img/mel_pred": plot_spectrogram_to_numpy(y_hat_mel[0, :, :].detach().unsqueeze(-1).cpu().numpy()),
                             "img/mel_raw": plot_spectrogram_to_numpy(mel[0].data.cpu().numpy()),
                             "img/latent": plot_spectrogram_to_numpy(latent[0].data.cpu().numpy()),
+                            "all/lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                        pred_lf0[0, 0, :].detach().cpu().numpy()),
+                            "all/norm_lf0": utils.plot_data_to_numpy(lf0[0, 0, :].cpu().numpy(),
+                                        norm_lf0[0, 0, :].detach().cpu().numpy()),
                         }
                         audios_dict = {
-                            'wav/gt':wav[0].detach().cpu(),
+                            'wav/gt':wav[0,0,:].detach().cpu(),
                             'wav/pred':wav_eval[0].detach().cpu()
                         }
                         milestone = self.step // self.cfg['train']['save_freq'] 
@@ -327,6 +311,6 @@ class Trainer(object):
 
 
 if __name__ == '__main__':
-    trainer = Trainer(cfg_path='ttts/vqvae/config_v3.json')
-    trainer.load('/home/hyc/tortoise_plus_zh/ttts/vqvae/logs/v3/2024-05-31-16-58-34/model-555.pt')
+    trainer = Trainer(cfg_path='configs/config.json')
+    trainer.load('/home/hyc/detail_vc/logs/2024-06-07-06-19-29/model-18.pt')
     trainer.train()
